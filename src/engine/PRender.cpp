@@ -3,19 +3,11 @@
 //Copyright (c) 2003 Janne Kivilahti
 //#########################
 #include "engine/PRender.hpp"
+#include <stdexcept>
 
 #include "engine/PDraw.hpp"
 #include "engine/PLog.hpp"
 #include "engine/types.hpp"
-
-#ifndef __ANDROID__
-#include "engine/render/PGl.hpp"
-#include "engine/render/PSdlSoft.hpp"
-#endif
-
-#ifdef _WIN32
-#include <versionhelpers.h>
-#endif
 
 #include "engine/render/PSdl.hpp"
 
@@ -41,17 +33,19 @@ static Renderer* renderer;
 
 void load_ui_texture(PFile::Path file) {
 
-	PFile::RW* rw = file.GetRW("r");
-	SDL_Surface* surface = IMG_Load_RW((SDL_RWops*)rw, 1);
-
-	renderer->load_ui_texture(surface);
-
+	try{
+		PFile::RW rw = file.GetRW2("r");
+		SDL_Surface* surface = IMG_Load_RW((SDL_RWops*)(rw._rwops), 0);
+		renderer->load_ui_texture(surface);
+	}
+	catch(const PFile::PFileException& e){
+		PLog::Write(PLog::ERR,"PRender", e.what());
+		throw std::runtime_error("Cannot load touchscreen texture!");
+	}
 }
 
 void render_ui(FRECT src, FRECT dst, float alpha) {
-
 	renderer->render_ui(src, dst, alpha);
-
 }
 
 void set_screen_fill(bool set) {
@@ -192,39 +186,13 @@ bool is_vsync() {
 	
 }
 
-int init(int width, int height, const char* name, const char* icon, int render_method) {
+int init(int width, int height, const char* name, const char* icon) {
 
 	window_name = name;
 	Uint32 window_flags = SDL_WINDOW_SHOWN;
 
 	PLog::Write(PLog::DEBUG, "PRender", "Initializing graphics");
 	PLog::Write(PLog::DEBUG, "PRender", "Video driver: %s", SDL_GetCurrentVideoDriver());
-
-	// set the render method if default
-	if (render_method == RENDERER_DEFAULT) {
-
-		// TODO choose renderer
-		#ifdef __ANDROID__
-
-		render_method = RENDERER_SDL;
-
-		#elif _WIN32
-
-		if (IsWindowsVistaOrGreater()) {
-			render_method = RENDERER_OPENGL;
-			PLog::Write(PLog::DEBUG, "PRender", "Isn't Windows XP");
-		} else {
-			render_method = RENDERER_SDL_SOFTWARE;
-			PLog::Write(PLog::DEBUG, "PRender", "Is Windows XP");
-		}
-
-		#else
-
-		render_method = RENDERER_OPENGL;
-
-		#endif
-
-	}
 
     #ifdef __ANDROID__
 
@@ -242,61 +210,6 @@ int init(int width, int height, const char* name, const char* icon, int render_m
 
     #else
 
-	// create a temporary window to check if GLSL 1.4 is supported
-	// TODO 1.5 - Solve this and warn with SDL Info 
-	if (render_method == RENDERER_OPENGL) {
-
-		SDL_Window* temp_window = SDL_CreateWindow("", 0, 0, 1, 1, SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
-		if (!temp_window) {
-
-			PLog::Write(PLog::FATAL, "PRender", "Couldn't create temporary window!");
-			render_method = RENDERER_SDL;
-			goto done;
-
-		}
-
-		SDL_GLContext context = SDL_GL_CreateContext(temp_window);
-		if (!context) {
-
-			SDL_DestroyWindow(temp_window);
-			PLog::Write(PLog::FATAL, "PRender", "Couldn't create OpenGL context!");
-			render_method = RENDERER_SDL;
-			goto done;
-
-		}
-
-		PLog::Write(PLog::DEBUG, "PRender", "Loading OpenGL functions");
-		PGlFuncs::load_lib();
-
-		const char* opengl_version = (const char*)glGetString(GL_VERSION);
-		const char* glsl_version = (const char*)glGetString(GL_SHADING_LANGUAGE_VERSION);
-
-		PLog::Write(PLog::DEBUG, "PRender", "OpenGL version: %s", glsl_version);
-		PLog::Write(PLog::DEBUG, "PRender", "GLSL version: %s", opengl_version);
-
-		int major, minor;
-		sscanf(glsl_version, "%d.%d", &major, &minor);
-
-		SDL_GL_DeleteContext(context);
-		SDL_DestroyWindow(temp_window);
-
-		if (major < 1 || (major == 1 && minor < 4)) {
-
-			PLog::Write(PLog::ERR, "PRender", "GLSL version %s is not supported!", glsl_version);
-			render_method = RENDERER_SDL;
-			goto done;
-
-		}
-
-		window_flags |= SDL_WINDOW_OPENGL;
-
-	}
-
-	done:
-
-	if (render_method == RENDERER_SDL_SOFTWARE)
-		fullscreen_mode = SDL_WINDOW_FULLSCREEN;
-
 	window = SDL_CreateWindow(name, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 	if (!window) {
 
@@ -305,7 +218,7 @@ int init(int width, int height, const char* name, const char* icon, int render_m
 
 	}
 
-	SDL_Surface* window_icon = SDL_LoadBMP(icon);
+	SDL_Surface* window_icon = IMG_Load(icon);
 	if (window_icon) {
 		SDL_SetWindowIcon(window, window_icon);
 		SDL_FreeSurface(window_icon);
@@ -315,23 +228,7 @@ int init(int width, int height, const char* name, const char* icon, int render_m
 	
 	#endif
 
-	switch (render_method) {
-
-		case RENDERER_SDL:
-			renderer = new PSdl(width, height, window); break;
-    #ifndef __ANDROID__
-		case RENDERER_SDL_SOFTWARE:
-			renderer = new PSdlSoft(width, height, window); break;
-		case RENDERER_OPENGL:
-			renderer = new PGl(width, height, window); break;
-		case RENDERER_OPENGLES:
-			//renderer = new PGles(width, height, window); break;
-    #endif
-		default:
-			renderer = new PSdl(width, height, window); break;
-		
-	}
-
+	renderer = new PSdl(width, height, window);
 	if (!renderer) {
 
 		PLog::Write(PLog::FATAL, "PRender", "Couldn't create renderer!");

@@ -4,35 +4,26 @@
 //#########################
 #pragma once
 
+/**
+ * TODO
+ * Completely redesign this file and system.cpp
+ */
+
+
 #include "engine/PFile.hpp"
 #include "engine/platform.hpp"
 #include <string>
 
-// settings text (shouldn't change during execution)
-
 extern int screen_width;
 extern int screen_height;
 
-extern int audio_buffer_size;
-extern bool audio_multi_thread;
-extern int render_method;
-
-#ifdef __ANDROID__
-// Variables used on data menu
-
-extern bool external_dir;
-
-extern std::string External_Path;
-extern std::string Internal_Path;
-
-#endif
-
 extern char id_code[8];
 
-extern std::string data_path;
+extern int global_gfx_texture;
+extern int global_gfx_texture2;
+extern int default_palette;
 
-extern int game_assets;
-extern int game_assets2;
+
 extern int bg_screen;
 
 extern int key_delay;
@@ -54,8 +45,8 @@ extern float fps;
 extern bool show_fps;
 extern bool speedrun_mode;
 
-extern bool PK2_error;
-extern const char* PK2_error_msg;
+//extern bool PK2_error;
+//extern const char* PK2_error_msg;
 
 #define FADE_FAST   0.05
 #define FADE_NORMAL 0.02
@@ -67,20 +58,14 @@ float Screen_Alpha();
 bool Is_Fading();
 void Update_Colors();
 
-void Do_Thunder();
+void StartLightningEffect();
 
-void Id_To_String(u32 id, char* string);
+void Id_To_String(u32 id, char* string, std::size_t n);
 
 void Calculate_SinCos();
-int  PK2_Error(const char* msg);
 
 int Clicked();
 
 void Draw_Cursor(int x, int y);
-void Move_DataPath(std::string new_path);
-
-void Prepare_DataPath();
-
-bool FindAsset(PFile::Path* path, const char* default_dir);
 
 int Set_Screen_Mode(int mode);

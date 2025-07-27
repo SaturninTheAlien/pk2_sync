@@ -8,16 +8,21 @@
 
 namespace PRender {
 
-struct FRECT {
-	
-	float x, y, w, h;
+class FRECT {
+public:
+	FRECT() = default;
+	FRECT(float x, float y, float w, float h)
+	:x(x), y(y), w(w), h(h){}
+	float x=0, y=0, w=0, h=0;
 
 };
 
-struct RECT {
-	
-	int x, y, w, h;
-
+class RECT {
+public:
+	RECT() = default;
+	RECT(int x, int y, int w, int h)
+	:x(x), y(y), w(w), h(h){}
+	int x=0, y=0, w=0, h=0;
 };
 
 class Renderer {
@@ -51,7 +56,7 @@ enum {
 	RENDERER_SDL,
 	RENDERER_OPENGL,
 	RENDERER_OPENGLES,
-	RENDERER_SDL_SOFTWARE,
+	//RENDERER_SDL_SOFTWARE,
 
 };
 
@@ -72,7 +77,7 @@ void get_window_position(int* x, int* y);
 int  set_vsync(bool set);
 bool is_vsync();
 
-int  init(int width, int height, const char* name, const char* icon, int render_method);
+int  init(int width, int height, const char* name, const char* icon);
 void terminate();
 void update(void* _buffer8);
 

@@ -10,18 +10,17 @@
 #include "engine/PRender.hpp"
 #include "engine/PInput.hpp"
 #include "engine/PSound.hpp"
-#include "engine/PUtils.hpp"
 #include "engine/PLang.hpp"
 #include "engine/PLog.hpp"
 #include "engine/PFile.hpp"
-#include "engine/PGui.hpp"
+#include <functional>
 
 namespace Piste {
 
-void init(int width, int height, const char* name, const char* icon, int render_method, int audio_buffer_size, bool audio_multi_thread);
+void init(int width, int height, const char* name, const char* icon, int audio_buffer_size);
 void terminate();
 
-void loop(int (*GameLogic)());
+void loop(std::function<void()> GameLogic);
 void stop();
 int get_fps();
 

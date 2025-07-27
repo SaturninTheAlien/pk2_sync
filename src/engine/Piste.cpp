@@ -7,8 +7,7 @@
 #include "engine/platform.hpp"
 
 #include <SDL.h>
-
-#include <iostream>
+#include <functional>
 
 #define UPDATE_FPS 30 //Update FPS each 30 frames
 
@@ -72,12 +71,16 @@ static void logic() {
 			PInput::InjectText(event.text.text);
 		else if(event.type == SDL_KEYDOWN && PInput::Is_Editing())
 			PInput::InjectKey(event.key.keysym.scancode);
+
+		/*else if(event.type==SDL_FINGERDOWN){
+			PInput::InjectFingerDown(event.tfinger.x, event.tfinger.y);
+		}*/
 		
 	}
 
 	// Pass PDraw informations do PRender
 	if (draw) {
-		PGui::update();
+		//PGui::update();
 		void* buffer8;
 		PDraw::get_buffer_data(&buffer8);
 		PRender::update(buffer8);
@@ -115,7 +118,7 @@ static void sdl_show_version() {
 }
 
 
-void init(int width, int height, const char* name, const char* icon, int render_method, int audio_buffer_size, bool audio_multi_thread) {
+void init(int width, int height, const char* name, const char* icon, int audio_buffer_size) {
 	
 	u32 flags = SDL_INIT_TIMER | SDL_INIT_AUDIO | SDL_INIT_VIDEO | SDL_INIT_EVENTS | \
                 SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC | SDL_INIT_GAMECONTROLLER /*| SDL_INIT_SENSOR*/;
@@ -130,9 +133,9 @@ void init(int width, int height, const char* name, const char* icon, int render_
 	sdl_show_version();
 	
 	PDraw::init(width, height);
-	PRender::init(width, height, name, icon, render_method);
+	PRender::init(width, height, name, icon);
 	PInput::init();
-	PSound::init(audio_buffer_size, audio_multi_thread);
+	PSound::init(audio_buffer_size);
 
 	ready = true;
 
@@ -151,20 +154,16 @@ void terminate() {
 
 }
 
-void loop(int (*GameLogic)()) {
+void loop(std::function<void()> GameLogic) {
 	
 	static int frame_counter = 0;
 	static u32 last_time = 0;
-		
-	int error = 0;
 
 	running = true;
 
 	while(running) {
 		
-		error = GameLogic();
-		if (error) break;
-		
+		GameLogic();
 		logic();
 
 		frame_counter++;

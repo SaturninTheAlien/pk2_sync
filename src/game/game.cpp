@@ -9,512 +9,739 @@
 #include "gfx/text.hpp"
 #include "gfx/particles.hpp"
 #include "gfx/effect.hpp"
-#include "episode/episodeclass.hpp"
-#include "settings.hpp"
-#include "gui.hpp"
-#include "language.hpp"
+#include "gfx/bg_particles.hpp"
 
-#include "engine/PLog.hpp"
+#include "episode/episodeclass.hpp"
+
+#include "settings/settings.hpp"
+#include "settings/config_txt.hpp"
+
+
+#include "gfx/touchscreen.hpp"
+#include "language.hpp"
+#include "exceptions.hpp"
+
 #include "engine/PSound.hpp"
+#include "engine/PLog.hpp"
 #include "engine/PDraw.hpp"
 #include "engine/PInput.hpp"
+#include "engine/PFilesystem.hpp"
+
+#include "lua/pk2_lua.hpp"
+#include "lua/lua_game_events.hpp"
 
 #include <cstring>
 
 GameClass* Game = nullptr;
 
-GameClass::GameClass(int idx) {
+GameClass::GameClass(int idx):
+spritePrototypes(Episode){
 
 	this->level_id = idx;
-	this->map_file = Episode->levels_list[idx].tiedosto;
+	this->level_file =  Episode->getLevelFilename(idx, true);
 
-	if (Episode->level_status[idx] & LEVEL_PASSED)
+	if(Episode->getLevelStatus(idx) & LEVEL_PASSED ){
 		this->repeating = true;
-
+	}
 }
 
-GameClass::GameClass(std::string map_file) {
+GameClass::GameClass(std::string level_file):
+spritePrototypes(Episode){
 
-	this->map_file = map_file;
+	this->repeating = true;
 
-	bool found = false;
-	for (uint i = 0; i < Episode->level_count; i++) {
-		if (map_file == Episode->levels_list[i].tiedosto) {
-			this->level_id = i;
-			found = true;
+	this->level_file = level_file;
+
+	if(!test_level){
+		int level_id_tmp = Episode->findLevelbyFilename(level_file);
+		if(level_id_tmp==-1){
+			PLog::Write(PLog::FATAL, "PK2", "Couldn't find %s on episode", level_file.c_str());
+			throw PExcept::PException("Couldn't find test level on episode");
+		}
+		this->level_id = level_id_tmp;
+	}
+	else{
+		this->level_id = -1;
+	}
+}
+
+GameClass::~GameClass(){
+
+	PSound::stop_music();
+	PDraw::palette_set(default_palette);
+	level.clear();
+	this->spritePrototypes.clear();
+
+	if(this->lua!=nullptr){
+		PK2lua::DestroyGameLuaVM(this->lua);
+		this->lua = nullptr;
+	}
+}
+
+void GameClass::update(int& debug_active_sprites){
+	if(this->playerSprite!=nullptr && this->playerSprite->energy>0){
+		AI_Functions::player_invisible = this->playerSprite;
+
+		if(this->playerSprite->invisible_timer>0){
+			AI_Functions::player = nullptr;
+		}
+		else{
+			AI_Functions::player = this->playerSprite;
+		}
+
+	}
+	else{
+		AI_Functions::player = nullptr;
+		AI_Functions::player_invisible = nullptr;
+	}
+
+	LevelSector* sector = this->playerSprite->level_sector;
+
+
+	if (!this->level_clear && (!this->has_time || this->timeout > 0)) {
+		this->level.setTilesAnimations(degree, this->palikka_animaatio/7, this->button1, this->button2, this->button3);
+		this->palikka_animaatio = 1 + this->palikka_animaatio % 34;
+	}
+
+	this->updateCamera();
+	Update_GameSFX();
+
+	/***
+	 * Execute events
+	 */
+
+	if(this->change_skulls){
+		this->change_skulls = false;
+
+		this->vibration = 90;
+		PInput::Vibrate(1000);
+
+		for(LevelSector* sector: this->level.sectors){
+			sector->changeSkulls(sector==this->playerSprite->level_sector);
+			sector->sprites.onSkullBlocksChanged();
+		}
+
+		if(this->lua!=nullptr){
+			PK2lua::TriggerEventListeners(PK2lua::LUA_EVENT_SKULL_BLOCKS_CHANGED);
 		}
 	}
 
-	if (!found) {
-		PLog::Write(PLog::FATAL, "PK2", "Couldn't find %s on episode", map_file.c_str());
-		PK2_Error("Couldn't find test map on episode");
+	if(this->event1){
+		this->event1 = false;
+
+		this->vibration = 90;
+		PInput::Vibrate(1000);
+
+		for(LevelSector* sector: this->level.sectors){
+			sector->sprites.onEvent1();
+		}
+		
+
+		if(this->lua!=nullptr){
+			PK2lua::TriggerEventListeners(PK2lua::LUA_EVENT_1);
+		}
 	}
 
+	if(this->event2){
+		this->event2 = false;
+
+		for(LevelSector* sector: this->level.sectors){
+			sector->sprites.onEvent2();
+		}
+		
+
+		if(this->lua!=nullptr){
+			PK2lua::TriggerEventListeners(PK2lua::LUA_EVENT_2);
+		}
+	}
+
+	if (!this->paused) {
+
+		/**
+		 * @brief 
+		 * Kill all the enemies mode
+		 */
+
+		if(this->level.game_mode == GAME_MODE_KILL_ALL &&
+			this->enemies <= 0 &&
+			this->playerSprite->damage_taken==0 && 
+			this->playerSprite->damage_timer==0 && 
+			this->playerSprite->energy>0){
+
+			this->finish();
+		}
+
+		/**
+		 * @brief 
+		 * Update Lua
+		 */
+
+		if(this->lua!=nullptr){
+			PK2lua::UpdateLua();
+		}
+
+		/**
+		 * @brief 
+		 * Update particles
+		 */
+
+		BG_Particles::Update(this->camera_x, this->camera_y);
+		Particles_Update();
+
+		/***
+		 * Update sprites
+		 */
+
+		if (!this->level_clear && (!this->has_time || this->timeout > 0)) {
+			debug_active_sprites = sector->sprites.onTickUpdate(this->camera_x, this->camera_y);
+			this->frame_count++;
+		}
+
+		Fadetext_Update();
+
+		this->moveBlocks();
+
+		degree = (1 + degree) % 360;
+
+		if (this->button1 > 0)
+			this->button1 --;
+
+		if (this->button2 > 0)
+			this->button2 --;
+
+		if (this->button3 > 0)
+			this->button3 --;
+
+		if (this->info_timer > 0)
+			this->info_timer--;
+
+		if (this->score_increment > 0){
+			this->score++;
+			this->score_increment--;
+		}
+
+		if (this->has_time && !this->level_clear) {
+			if (this->timeout > 0)
+				this->timeout--;
+			else
+				this->game_over = true;
+			
+		}
+	}
+	
+	SpriteClass * Player_Sprite = this->playerSprite;
+
+	if (Player_Sprite->energy < 1) {
+		this->game_over = true;
+	}
+
+	if (this->level_clear || this->game_over) {
+
+		if (this->exit_timer > 1)
+			this->exit_timer--;
+
+		if (this->exit_timer == 0)
+			this->exit_timer = 700;//800;//2000;
+
+		if (PInput::Keydown(Input->attack1) || PInput::Keydown(Input->attack2) ||
+			PInput::Keydown(Input->jump) || Clicked() ||
+			TouchScreenControls.any)
+			if (this->exit_timer > 2 && this->exit_timer < 500/*600*//*1900*/ && key_delay == 0)
+				this->exit_timer = 2;
+
+		if (this->exit_timer == 2) {
+			
+			Fade_out(FADE_NORMAL);
+			if (this->game_over)
+				PSound::set_musicvolume(0);
+		
+		}
+	}
+
+	if (key_delay == 0) {
+		if (!this->game_over && !this->level_clear) {
+			if (PInput::Keydown(Input->open_gift) || TouchScreenControls.gift) {
+				Gifts_Use(sector->sprites);
+				key_delay = 10;
+			}
+			
+			if (PInput::Keydown(PInput::P)) {
+				this->paused = !this->paused;
+				key_delay = 20;
+			}
+			
+			if (PInput::Keydown(PInput::DEL) && !this->paused) {
+				if(!config_txt.silent_suicide){
+					Player_Sprite->damage_taken = Player_Sprite->energy;
+					Player_Sprite->damage_taken_type = DAMAGE_SELF_DESTRUCTION;
+					Player_Sprite->self_destruction = true;
+				}
+				else{
+					Player_Sprite->energy = 0;
+					Player_Sprite->removed = true;
+				}
+			}
+
+			if (PInput::Keydown(PInput::TAB) || PInput::Keydown(PInput::JOY_GUIDE) || TouchScreenControls.tab){
+				Gifts_ChangeOrder();
+				key_delay = 10;
+			}			
+		}			
+	}
+
+	if (dev_mode){ //Debug
+		if (key_delay == 0) {
+			if (PInput::Keydown(PInput::F)) {
+				show_fps = !show_fps;
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::Z)) {
+				if (this->button1 < this->level.button1_time - 64) this->button1 = this->level.button1_time;
+				if (this->button2 < this->level.button2_time - 64) this->button2 = this->level.button2_time;
+				if (this->button3 < this->level.button3_time - 64) this->button3 = this->level.button3_time;
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::X)) {
+				if (this->button1 > 64) this->button1 = 64;
+				if (this->button2 > 64) this->button2 = 64;
+				if (this->button3 > 64) this->button3 = 64;
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::T)) {
+				Settings.double_speed = !Settings.double_speed;
+				key_delay = 20;
+			}
+			/*if (PInput::Keydown(PInput::G)) {
+				Settings.draw_transparent = !Settings.draw_transparent;
+				key_delay = 20;
+			}*/
+			if (PInput::Keydown(PInput::L)) {
+				this->keys = 0;
+				this->openLocks();
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::K)) {
+				this->change_skulls = true;
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::R)) {
+
+				Player_Sprite->energy = 10;
+				Player_Sprite->removed = false;
+				this->game_over = false;
+
+				double pos_x = 0;
+				double pos_y = 0;
+
+				u32 sector_id = 0;
+
+				this->selectStart(pos_x, pos_y, sector_id);
+
+				if(Episode->legacy_start_offset){
+					pos_y -= playerSprite->prototype->height / 2;
+				}
+
+				this->teleportPlayer(pos_x, pos_y, this->level.sectors[sector_id]);
+				
+				key_delay = 20;
+			}
+			if (PInput::Keydown(PInput::END)) {
+				key_delay = 20;
+				this->finish();
+			}
+			if (PInput::Keydown(PInput::A)) {
+				key_delay = 20;
+				if(this->initialPlayerPrototype!=nullptr){
+
+					PrototypeClass* ammo1 = Player_Sprite->ammo1;
+					PrototypeClass* ammo2 = Player_Sprite->ammo2;
+
+					Player_Sprite->energy = 10;
+					Player_Sprite->transformTo(this->initialPlayerPrototype);
+					Effect_Stars(Player_Sprite->x, Player_Sprite->y, COLOR_VIOLET);
+
+					if(Player_Sprite->ammo1==nullptr){
+						Player_Sprite->ammo1 = ammo1;
+					}
+
+					if(Player_Sprite->ammo2==nullptr){
+						Player_Sprite->ammo2 = ammo2;
+					}
+
+				}
+			}
+		}
+		if (PInput::Keydown(PInput::U))
+			Player_Sprite->b = -10;
+		if (PInput::Keydown(PInput::E)) {
+			Player_Sprite->energy = 10;
+			this->game_over = false;
+		}		
+		if(key_delay==0){
+
+			if (PInput::Keydown(PInput::V)){
+				if(Player_Sprite->invisible_timer>1){
+					Player_Sprite->invisible_timer = 1;
+				}
+				else{
+					Player_Sprite->invisible_timer = 3000;
+				}
+				key_delay = 30;
+			}
+
+			if (PInput::Keydown(PInput::S)) {
+				if(Player_Sprite->super_mode_timer>1){
+					Player_Sprite->super_mode_timer = 1;
+				}
+				else{
+					if(Episode->supermode_music){
+						this->startSupermodeMusic();
+					}
+					Player_Sprite->super_mode_timer = 3000;
+				}
+				key_delay = 30;
+			}
+		}
+	}
 }
 
-GameClass::~GameClass() {}
 
-int GameClass::Start() {
+void GameClass::startSupermodeMusic(){
+	std::optional<PFile::Path> p = PFilesystem::FindAsset("super.xm", PFilesystem::MUSIC_DIR, ".ogg");
+	if(p.has_value()){
+		PSound::start_music(*p);
+	}
+	else{
+		PLog::Write(PLog::ERR, "\"super.xm\" not found!");
+	}
+}
+
+void GameClass::start() {
 
 	if (this->started)
-		return 1;
+		return;
+	
+	if(this->lua!=nullptr){
+		PK2lua::DestroyGameLuaVM(this->lua);
+		this->lua = nullptr;
+	}
 
-	// TODO - put these on the class initializer
 	Gifts_Clean(); //Reset gifts
-	Sprites_clear(); //Reset sprites
-	Prototypes_ClearAll(); //Reset prototypes
 	Fadetext_Init(); //Reset fade text
-	GUI_Reset(); //Reset GUI
+	TouchScreenControls.reset();
 
 	if (this->Open_Map() == 1)
-		PK2_Error("Can't load map");
+		throw PExcept::PException("Can't load level");
 
-	this->Calculate_Tiles();
+	this->moveBlocks();
 
 	PSound::set_musicvolume(Settings.music_max_volume);
 
-	this->started = true;
+	if(this->lua!=nullptr){
+		PK2lua::TriggerEventListeners(PK2lua::LUA_EVENT_GAME_STARTED);
+	}
 
-	return 0;
-	
+	this->started = true;
 }
 
-int GameClass::Finnish() {
+void GameClass::finish() {
 
 	if (this->level_clear)
-		return -1;
+		return;
 	
 	this->level_clear = true;
 
-	if (PSound::start_music(PFile::Path("music" PE_SEP "hiscore.xm")) == -1)
-		PK2_Error("Can't find hiscore.xm");	
-	
-	Episode->level_status[this->level_id] |= LEVEL_PASSED;
-	
-	if (this->apples_count > 0)
-		if (this->apples_got >= this->apples_count)
-			Episode->level_status[this->level_id] |= LEVEL_ALLAPPLES;
+	std::optional<PFile::Path> music_path = PFilesystem::FindAsset("hiscore.xm", PFilesystem::MUSIC_DIR, ".ogg");
 
-	Episode->Update_NextLevel();
+	if(!music_path.has_value()){
+		throw PExcept::PException("\"hiscore.xm\" not found!");
+	}
+
+	if (PSound::start_music(*music_path) == -1){
+		PLog::Write(PLog::ERR, "Can't play \"hiscore.xm\"");
+	}
+
+
+	if(!test_level){
+		u8 status = Episode->getLevelStatus(this->level_id);
+
+		status |= LEVEL_PASSED;
+		if(this->apples_count > 0){
+			status |= LEVEL_HAS_BIG_APPLES;
+			if(this->apples_got >= this->apples_count){
+				status |= LEVEL_ALLAPPLES;
+			}
+		}
+
+		Episode->updateLevelStatus(this->level_id, status);	
+	}
 	
 	PSound::set_musicvolume_now(Settings.music_max_volume);
-
-	return 0;
-
-}
-
-int GameClass::Calculete_TileMasks() {
-	
-	u8 *buffer = nullptr;
-	u32 leveys;
-	int x, y;
-	u8 color;
-
-	PDraw::drawimage_start(map.tiles_buffer, buffer, leveys);
-	for (int mask=0; mask<BLOCK_MAX_MASKS; mask++){
-		for (x=0; x<32; x++){
-			y=0;
-			while (y<31 && (color = buffer[x+(mask%10)*32 + (y+(mask/10)*32)*leveys])==255)
-				y++;
-
-			palikkamaskit[mask].alas[x] = y;
-		}
-
-		for (x=0; x<32; x++){
-			y=31;
-			while (y>=0 && (color = buffer[x+(mask%10)*32 + (y+(mask/10)*32)*leveys])==255)
-				y--;
-
-			palikkamaskit[mask].ylos[x] = 31-y;
-		}
-	}
-	PDraw::drawimage_end(map.tiles_buffer);
-
-	return 0;
-}
-
-//PK2KARTTA::Clean_TileBuffer()
-int GameClass::Clean_TileBuffer() {
-
-	u8 *buffer = NULL;
-	u32 leveys;
-	int x,y;
-
-	int w, h;
-	PDraw::image_getsize(map.tiles_buffer, w, h);
-
-	PDraw::drawimage_start(map.tiles_buffer, buffer, leveys);
-	for (y = 0; y < h; y++)
-		for(x = 0; x < w; x++)
-			if (buffer[x+y*leveys] == 254)
-				buffer[x+y*leveys] = 255;
-	PDraw::drawimage_end(map.tiles_buffer);
-
-	if (map.bg_tiles_buffer < 0)
-			return 0;
-	
-	// Clan bg buffer
-	PDraw::image_getsize(map.bg_tiles_buffer, w, h);
-
-	PDraw::drawimage_start(map.bg_tiles_buffer, buffer, leveys);
-	for (y = 0; y < h; y++)
-		for(x = 0; x < w; x++)
-			if (buffer[x+y*leveys] == 254)
-				buffer[x+y*leveys] = 255;
-	PDraw::drawimage_end(map.bg_tiles_buffer);
-
-	return 0;
-}
-
-// This moves the collisions of the blocks palette
-int GameClass::Move_Blocks() {
-
-	this->lasketut_palikat[BLOCK_LIFT_HORI].vasen = (int)cos_table(degree);
-	this->lasketut_palikat[BLOCK_LIFT_HORI].oikea = (int)cos_table(degree);
-
-	this->lasketut_palikat[BLOCK_LIFT_VERT].ala = (int)sin_table(degree);
-	this->lasketut_palikat[BLOCK_LIFT_VERT].yla = (int)sin_table(degree);
-
-	int kytkin1_y = 0,
-		kytkin2_y = 0,
-		kytkin3_x = 0;
-
-	if (this->button1 > 0) {
-		kytkin1_y = 64;
-
-		if (this->button1 < 64)
-			kytkin1_y = this->button1;
-
-		if (this->button1 > map.button1_time - 64)
-			kytkin1_y = map.button1_time - this->button1;
-	}
-
-	if (this->button2 > 0) {
-		kytkin2_y = 64;
-
-		if (this->button2 < 64)
-			kytkin2_y = this->button2;
-
-		if (this->button2 > map.button2_time - 64)
-			kytkin2_y = map.button2_time - this->button2;
-	}
-
-	if (this->button3 > 0) {
-		kytkin3_x = 64;
-
-		if (this->button3 < 64)
-			kytkin3_x = this->button3;
-
-		if (this->button3 > map.button3_time - 64)
-			kytkin3_x = map.button3_time - this->button3;
-	}
-
-	kytkin1_y /= 2;
-	kytkin2_y /= 2;
-	kytkin3_x /= 2;
-
-	this->lasketut_palikat[BLOCK_BUTTON1].ala = kytkin1_y;
-	this->lasketut_palikat[BLOCK_BUTTON1].yla = kytkin1_y;
-
-	this->lasketut_palikat[BLOCK_BUTTON2_UP].ala = -kytkin2_y;
-	this->lasketut_palikat[BLOCK_BUTTON2_UP].yla = -kytkin2_y;
-
-	this->lasketut_palikat[BLOCK_BUTTON2_DOWN].ala = kytkin2_y;
-	this->lasketut_palikat[BLOCK_BUTTON2_DOWN].yla = kytkin2_y;
-
-	this->lasketut_palikat[BLOCK_BUTTON2].ala = kytkin2_y;
-	this->lasketut_palikat[BLOCK_BUTTON2].yla = kytkin2_y;
-
-	this->lasketut_palikat[BLOCK_BUTTON3_RIGHT].oikea = kytkin3_x;
-	this->lasketut_palikat[BLOCK_BUTTON3_RIGHT].vasen = kytkin3_x;
-	this->lasketut_palikat[BLOCK_BUTTON3_RIGHT].koodi = BLOCK_LIFT_HORI;
-
-	this->lasketut_palikat[BLOCK_BUTTON3_LEFT].oikea = -kytkin3_x;
-	this->lasketut_palikat[BLOCK_BUTTON3_LEFT].vasen = -kytkin3_x;
-	this->lasketut_palikat[BLOCK_BUTTON3_LEFT].koodi = BLOCK_LIFT_HORI;
-
-	this->lasketut_palikat[BLOCK_BUTTON3].ala = kytkin3_x;
-	this->lasketut_palikat[BLOCK_BUTTON3].yla = kytkin3_x;
-
-	return 0;
-
-}
-
-int GameClass::Calculate_Tiles() {
-	
-	PK2BLOCK palikka;
-
-	for (int i=0;i<150;i++){
-		palikka = this->lasketut_palikat[i];
-
-		palikka.vasen  = 0;
-		palikka.oikea  = 0;//32
-		palikka.yla	   = 0;
-		palikka.ala    = 0;//32
-
-		palikka.koodi  = i;
-
-		if ((i < 80 || i > 139) && i != 255){
-			palikka.tausta = false;
-
-			palikka.oikealle	= BLOCK_WALL;
-			palikka.vasemmalle	= BLOCK_WALL;
-			palikka.ylos		= BLOCK_WALL;
-			palikka.alas		= BLOCK_WALL;
-
-			// Erikoislattiat
-
-			if (i > 139){
-				palikka.oikealle	= BLOCK_BACKGROUND;
-				palikka.vasemmalle	= BLOCK_BACKGROUND;
-				palikka.ylos		= BLOCK_BACKGROUND;
-				palikka.alas		= BLOCK_BACKGROUND;
-			}
-
-			// L�pik�velt�v� lattia
-
-			if (i == BLOCK_BARRIER_DOWN){
-				palikka.oikealle	= BLOCK_BACKGROUND;
-				palikka.ylos		= BLOCK_BACKGROUND;
-				palikka.alas		= BLOCK_WALL;
-				palikka.vasemmalle	= BLOCK_BACKGROUND;
-				palikka.ala -= 27;
-			}
-
-			// M�et
-
-			if (i > 49 && i < 60){
-				palikka.oikealle	= BLOCK_BACKGROUND;
-				palikka.ylos		= BLOCK_WALL;
-				palikka.alas		= BLOCK_WALL;
-				palikka.vasemmalle	= BLOCK_BACKGROUND;
-				palikka.ala += 1;
-			}
-
-			// Kytkimet
-
-			if (i >= BLOCK_BUTTON1 && i <= BLOCK_BUTTON3){
-				palikka.oikealle	= BLOCK_WALL;
-				palikka.ylos		= BLOCK_WALL;
-				palikka.alas		= BLOCK_WALL;
-				palikka.vasemmalle	= BLOCK_WALL;
-			}
-		}
-		else{
-			palikka.tausta = true;
-
-			palikka.oikealle	= BLOCK_BACKGROUND;
-			palikka.vasemmalle	= BLOCK_BACKGROUND;
-			palikka.ylos		= BLOCK_BACKGROUND;
-			palikka.alas		= BLOCK_BACKGROUND;
-		}
-
-		if (i > 131 && i < 140)
-			palikka.water = true;
-		else
-			palikka.water = false;
-
-		this->lasketut_palikat[i] = palikka;
-	}
-
-	Move_Blocks();
-
-	return 0;
 }
 
 int GameClass::Open_Map() {
-	
-	PFile::Path path = Episode->Get_Dir(map_file);
-	
-	if (map.Load(path) == 1) {
 
-		PLog::Write(PLog::ERR, "PK2", "Can't load map \"%s\" at \"%s\"", map_file.c_str(), path.c_str());
-		return 1;
-	
+	std::optional<PFile::Path> levelPath = PFilesystem::FindEpisodeAsset(level_file, "");
+	if(!levelPath.has_value()){
+		throw PExcept::PException("Cannot find the level file: \""+level_file+"\"!");
+	}
+	level.load(*levelPath, false);
+
+	/**
+	 * @brief 
+	 * Load lua
+	 */
+	if(this->level.lua_script!=""){
+		this->lua = PK2lua::CreateGameLuaVM(this->level.lua_script);
+	}
+	else{
+		PLog::Write(PLog::INFO, "PK2lua", "No Lua scripting in this level");
 	}
 
-	timeout = map.aika * TIME_FPS;
+
+	timeout = level.map_time * TIME_FPS;
 
 	if (timeout > 0)
 		has_time = true;
 	else
 		has_time = false;
 
-	if (!Episode->use_button_timer) {
-		map.button1_time = SWITCH_INITIAL_VALUE;
-		map.button2_time = SWITCH_INITIAL_VALUE;
-		map.button3_time = SWITCH_INITIAL_VALUE;
+	//if (!Episode->use_button_timer) {
+	level.button1_time = SWITCH_INITIAL_VALUE;
+	level.button2_time = SWITCH_INITIAL_VALUE;
+	level.button3_time = SWITCH_INITIAL_VALUE;
+	//}
+
+	this->placeSprites();
+	this->level.calculateBlockTypes();
+	for(LevelSector* sector: this->level.sectors){
+		sector->calculateEdges();
 	}
-
-	if (strcmp(map.versio,"1.2") == 0 || strcmp(map.versio,"1.3") == 0)
-		if (Prototypes_GetAll() == 1)
-			return 1;
-
-	Calculete_TileMasks();
-
-	if (Clean_TileBuffer() == 1)
-		return 1;
-
-	Place_Sprites();
-
-	if (this->chick_mode)
-		PLog::Write(PLog::DEBUG, "PK2", "Chick mode on");
-
-	Select_Start();
-	
-	this->keys = Count_Keys();
-
-	Sprites_start_directions();
 
 	Particles_Clear();
-	Particles_LoadBG(&map);
 
-	if ( strcmp(map.musiikki, "") != 0 ) {
+	LevelSector* sector = this->playerSprite->level_sector;
 
-		PFile::Path music_path = Episode->Get_Dir(map.musiikki);
-
-		if (!FindAsset(&music_path, "music" PE_SEP)) {
-
-			PLog::Write(PLog::ERR, "PK2", "Can't find music \"%s\", trying \"song01.xm\"", music_path.GetFileName().c_str());
-			music_path = PFile::Path("music" PE_SEP "song01.xm");
-
-		}
-		
-		if (PSound::start_music(music_path) == -1)
-			PLog::Write(PLog::FATAL, "PK2", "Can't load any music file");
-
-	}
+	BG_Particles::Init(sector->weather, sector->rain_color);
+	sector->startMusic();
+	
 	return 0;
 }
 
-void GameClass::Place_Sprites() {
+void GameClass::placeSprites() {
+	std::array<PrototypeClass*, 255> mapping;
 
-	Sprites_clear();
-	Sprites_add(Prototypes_List[map.pelaaja_sprite], 1, 0, 0, nullptr, false);
+	//Load prototypes
+	std::size_t prototypes_number = this->level.sprite_prototype_names.size();
+	if(prototypes_number > mapping.size()){
+		std::ostringstream os;
+		os<<"Too many sprite prototypes: "<<prototypes_number<<std::endl;
+		os<<mapping.size()<<" is the current limit."<<std::endl;
+		os<< "Dependency sprites (ammo, transformation and so on)"
+		" do not count into the limit";
 
-	for (u32 x = 0; x < PK2MAP_MAP_WIDTH; x++) {
-		for (u32 y = 0; y < PK2MAP_MAP_HEIGHT; y++) {
+		throw std::runtime_error(os.str());
+	}
 
-			int sprite = map.spritet[x+y*PK2MAP_MAP_WIDTH];
-			PrototypeClass* protot = Prototypes_List[sprite];
+	for(std::size_t i=0;i<mapping.size();++i){
+		mapping[i] = nullptr;
+	}
 
-			if (sprite != 255) {
+	for(std::size_t i=0;i<prototypes_number;++i){
+		const std::string& name = level.sprite_prototype_names[i];
+		if(!name.empty()){
+			mapping[i] =  this->spritePrototypes.loadPrototype(level.sprite_prototype_names[i]);
+		}
+	}
 
-				if (!Episode->ignore_collectable)
-					if (strncmp(protot->nimi, Episode->collectable_name.c_str(), Episode->collectable_name.size()) == 0)
-						this->apples_count++;
+	// Load sprite assets
+	this->spritePrototypes.loadSpriteAssets();
 
-				if (protot->Onko_AI(AI_CHICK) || protot->Onko_AI(AI_CHICKBOX))
-					this->chick_mode = true;
+	// Player prototype
+	int player_index = level.player_sprite_index;
+	if(player_index<0 || player_index >= int(mapping.size())){
+		std::ostringstream os;
+		os<<"Incorrect player sprite index: "<<player_index;
+		throw PExcept::PException(os.str());
+	}
 
-				Sprites_add(protot, 0, x*32, y*32 - protot->korkeus+32, nullptr, false);
+
+	PrototypeClass* player_prototype = mapping[player_index];
+	if(player_prototype==nullptr){
+		throw PExcept::PException("Null player prototype is quite serious error!");
+	}
+
+	this->initialPlayerPrototype = player_prototype;
+
+	// Add player
+	{
+		double pos_x = 0;
+		double pos_y = 0;
+		u32 sector_id = 0;
+
+		this->selectStart(pos_x, pos_y, sector_id);
+		this->playerSprite= this->level.sectors[sector_id]->sprites.addPlayer(player_prototype, pos_x, pos_y);
+
+		if(Episode->legacy_start_offset){
+			this->playerSprite->y -= player_prototype->height / 2;
+		}
+
+		this->level.sectors[sector_id]->background->setPalette();
+		this->setCamera(Episode->legacy_camera_offset);
+	}
+
+	//set GFX
+	this->gfxTexture = this->playerSprite->level_sector->gfxTexture;
+
+	// Add other sprites
+	for(LevelSector* sector: this->level.sectors){
+
+		for (u32 x = 0; x < sector->getWidth(); x++) {
+			for (u32 y = 0; y < sector->getHeight(); y++){		
+
+				int sprite = sector->sprite_tiles[x+y*sector->getWidth()];
+				if(sprite<0||sprite>=255) continue;
+
+				PrototypeClass* prototype = mapping[sprite];
+				if(prototype==nullptr) continue;
+
+				/**
+				 * @brief 
+				 * Count big apples
+				 */
+				if(prototype->big_apple){
+					this->apples_count++;
+				}
 				
+				/**
+				 * @brief 
+				 * Count big apples in boxes
+				 */
+				if(prototype->bonus != nullptr && prototype->bonus->big_apple && prototype->bonus_always){
+					this->apples_count += prototype->bonuses_number;
+				}
+
+				/**
+				 * @brief 
+				 * Count keys
+				 */
+				if (prototype->can_open_locks && 
+					!prototype->indestructible){
+					this->keys++;
+				}
+
+				/**
+				 * @brief 
+				 * Count enemies
+				 */
+				if(prototype->type == TYPE_GAME_CHARACTER
+				&& !prototype->indestructible
+				&& prototype->damage > 0 //to ignore switches, boxes and so on
+				&& prototype->enemy){
+					this->enemies++;
+				}
+
+				sector->sprites.addLevelSprite(prototype, x*32, y*32 - prototype->height+32);
+			}
+		}
+
+		sector->sprites.sortBg();
+	}
+}
+
+void GameClass::selectStart(double& pos_x, double& pos_y, u32& sector) {
+
+	pos_x = 320;
+	pos_y = 196;
+
+	std::vector<BlockPosition> startSigns;
+
+	for(u32 i=0; i<level.sectors.size(); ++i){
+		level.sectors[i]->countStartSigns(startSigns, i);
+	}
+
+	int selected_start = 0;
+	if(startSigns.size()>1){
+		selected_start = rand() % startSigns.size();
+	}
+
+
+	if(startSigns.size()>0){
+		pos_x = startSigns[selected_start].x * 32 + 17;
+		pos_y = startSigns[selected_start].y * 32;
+		sector = startSigns[selected_start].sector;
+	}
+}
+
+SpriteClass* GameClass::selectTeleporter(SpriteClass* entryTelporter, PrototypeClass* exitPrototype){
+	std::vector<SpriteClass*> teleporters;
+	for(LevelSector* sector: this->level.sectors){
+		for(SpriteClass* sprite: sector->sprites.Sprites_List){
+			if(sprite->prototype== exitPrototype && sprite!=entryTelporter){
+				teleporters.push_back(sprite);
 			}
 		}
 	}
 
-	Sprites_sort_bg();
-
+	if(teleporters.size()==0)return nullptr;
+	else if(teleporters.size()==1) return teleporters[0];
+	else return teleporters[rand()% teleporters.size()];
 }
 
-void GameClass::Select_Start() {
+void GameClass::teleportPlayer(double x, double y, LevelSector*sector){
+	this->playerSprite->x = x;
+	this->playerSprite->y = y;
 
-	double  pos_x = 320;
-	double  pos_y = 196;
+	/**
+	 * @brief 
+	 * Change sector
+	 */
+	if(sector!=nullptr && this->playerSprite->level_sector!=sector){
 
-	std::vector<u32> starts;
+		LevelSector* previous_sector = this->playerSprite->level_sector;
+		previous_sector->sprites.Sprites_List.remove(this->playerSprite);
 
-	for (u32 i = 0; i < PK2MAP_MAP_SIZE; i++)
-		if (map.seinat[i] == BLOCK_START)
-			starts.push_back(i);
+		sector->sprites.Sprites_List.push_front(this->playerSprite);
+		this->playerSprite->level_sector=sector;
 
-	if (starts.size() > 0) {
-		u32 i = starts[rand() % starts.size()];
+		//Change palette
+		sector->background->setPalette();
 
-		u32 x = i % PK2MAP_MAP_WIDTH;
-		u32 y = i / PK2MAP_MAP_WIDTH;
+		//Change weather
+		BG_Particles::Init(sector->weather, sector->rain_color);
+		Particles_Clear();
 
-		pos_x = x*32;
-		pos_y = y*32;
-
-	}
-
-	Player_Sprite->x = pos_x + Player_Sprite->tyyppi->leveys/2;
-	Player_Sprite->y = pos_y - Player_Sprite->tyyppi->korkeus/2;
-
-	this->camera_x = (int)Player_Sprite->x;
-	this->camera_y = (int)Player_Sprite->y;
-	this->dcamera_x = this->camera_x;
-	this->dcamera_y = this->camera_y;
-
-}
-
-int GameClass::Count_Keys() {
-
-	int keys = 0;
-
-	for (u32 x=0; x < PK2MAP_MAP_SIZE; x++){
-		u8 sprite = map.spritet[x];
-		if (sprite != 255)
-			if (Prototypes_List[sprite]->avain && 
-				Prototypes_List[sprite]->tuhoutuminen != FX_DESTRUCT_EI_TUHOUDU)
-
-				keys++;
-	}
-
-	return keys;
-}
-
-void GameClass::Change_SkullBlocks() {
-
-	for (u32 x = 0; x < PK2MAP_MAP_WIDTH; x++)
-		for (u32 y = 0; y < PK2MAP_MAP_HEIGHT; y++){
-			
-			u8 front = map.seinat[x+y*PK2MAP_MAP_WIDTH];
-			u8 back  = map.taustat[x+y*PK2MAP_MAP_WIDTH];
-
-			if (front == BLOCK_SKULL_FOREGROUND){
-				map.seinat[x+y*PK2MAP_MAP_WIDTH] = 255;
-				if (back != BLOCK_SKULL_FOREGROUND)
-					Effect_SmokeClouds(x*32+24,y*32+6);
-
-			}
-
-			if (back == BLOCK_SKULL_BACKGROUND && front == 255)
-				map.seinat[x+y*PK2MAP_MAP_WIDTH] = BLOCK_SKULL_FOREGROUND;
+		//Change music
+		if(sector->music_name!=previous_sector->music_name){
+			sector->startMusic();
 		}
 
+		//Change GFX texture
+		this->gfxTexture = sector->gfxTexture;
+	}
+
+	Fade_in(FADE_NORMAL);
+
+	this->setCamera();
+}
+
+void GameClass::openLocks() {
 	//Put in game
 	this->vibration = 90;//60
 	PInput::Vibrate(1000);
 
-	map.Calculate_Edges();
+	showInfo(tekstit->Get_Text(PK_txt.game_locksopen));
+
+	for(LevelSector* sector: this->level.sectors){
+		sector->openKeylocks(sector==this->playerSprite->level_sector);
+	}
+
+	if(this->lua!=nullptr){
+		PK2lua::TriggerEventListeners(PK2lua::LUA_EVENT_KEYLOCKS_OPENED);
+	}
 }
 
-void GameClass::Open_Locks() {
-
-	for (u32 x = 0; x < PK2MAP_MAP_WIDTH; x++)
-		for (u32 y = 0; y < PK2MAP_MAP_HEIGHT; y++){
-			
-			u8 palikka = map.seinat[x+y*PK2MAP_MAP_WIDTH];
-			
-			if (palikka == BLOCK_LOCK){
-				map.seinat[x+y*PK2MAP_MAP_WIDTH] = 255;
-				Effect_SmokeClouds(x*32+6,y*32+6);
-			}
-		}
-
-	//Put in game
-	this->vibration = 90;//60
-	PInput::Vibrate(1000);
-
-	Show_Info(tekstit->Get_Text(PK_txt.game_locksopen));
-
-	map.Calculate_Edges();
-
-}
-
-void GameClass::Show_Info(const char *text) {
+void GameClass::showInfo(const std::string& text) {
 
 	if (info_text.compare(text) != 0 || info_timer == 0) {
 
@@ -524,8 +751,136 @@ void GameClass::Show_Info(const char *text) {
 	}
 }
 
-bool GameClass::isStarted() {
+void GameClass::drawInfoText(){
+	if(this->info_timer > 0){
+		std::pair<int, int> box_size = PDraw::font_get_text_size(fontti1, this->info_text);
 
-	return started;
+		box_size.first += 8;
+		box_size.second += 8;
 
+		PDraw::RECT infoBG(screen_width/2-(box_size.first/2), 60,
+						screen_width/2+(box_size.first/2), 60 + box_size.second);
+
+		int tmp = (box_size.second - this->info_timer) / 2;
+
+		if(tmp > 0){
+
+			infoBG.y += tmp;
+			infoBG.h -= tmp;
+		}
+		else if(this->info_timer > INFO_TIME - box_size.second){
+			//int tmp = 10 - (INFO_TIME - this->info_timer) / 2;
+			tmp = (box_size.second - INFO_TIME + this->info_timer) / 2;
+
+			infoBG.y += tmp;
+			infoBG.h -= tmp;
+ 		}
+
+		PDraw::screen_fill(infoBG.x-1,infoBG.y-1,infoBG.w+1,infoBG.h+1,51);
+		PDraw::screen_fill(infoBG.x, infoBG.y, infoBG.w, infoBG.h, 38);
+
+		//tmp = this->info_timer - 11
+		tmp = this->info_timer - 1 - box_size.second;
+
+		if (tmp >= 100)
+			PDraw::font_write(fontti1,this->info_text,infoBG.x+4,infoBG.y+4);
+		else if(tmp > 0)
+			PDraw::font_writealpha_s(fontti1,this->info_text,infoBG.x+4,infoBG.y+4,tmp);
+	}
 }
+
+void GameClass::setCamera(bool legacy_mode){
+
+	LevelSector* sector = this->playerSprite->level_sector;
+
+	if(legacy_mode){
+		this->camera_x = (int)this->playerSprite->x;
+		this->camera_y = (int)this->playerSprite->y;
+	}
+	else{
+		this->camera_x = (int)this->playerSprite->x - screen_width/2;
+		this->camera_y = (int)this->playerSprite->y - screen_height/2;
+	}
+	
+	if (this->camera_x < 0)
+		this->camera_x = 0;
+
+	if (this->camera_y < 0)
+		this->camera_y = 0;
+
+	if (this->camera_x > int(sector->getWidth() -screen_width/32)*32)
+		this->camera_x = int(sector->getWidth()-screen_width/32)*32;
+
+	if (this->camera_y > int(sector->getHeight()-screen_height/32)*32)
+		this->camera_y = int(sector->getHeight()-screen_height/32)*32;
+
+	this->dcamera_x = this->camera_x;
+	this->dcamera_y = this->camera_y;
+
+	this->dcamera_a = 0;
+	this->dcamera_b = 0;
+}
+
+void GameClass::updateCamera(){
+	this->camera_x = (int) this->playerSprite->x-screen_width / 2;
+	this->camera_y = (int) this->playerSprite->y-screen_height / 2;
+
+	LevelSector* sector = playerSprite->level_sector;
+	
+	if(dev_mode && PInput::MouseLeft() && !Settings.touchscreen_mode) {
+		this->camera_x += PInput::mouse_x - screen_width / 2;
+		this->camera_y += PInput::mouse_y - screen_height / 2;
+	}
+
+	if (this->vibration > 0) {
+		this->dcamera_x += (rand()%this->vibration-rand()%this->vibration)/5;
+		this->dcamera_y += (rand()%this->vibration-rand()%this->vibration)/5;
+
+		this->vibration--;
+	}
+
+	if (this->button_vibration > 0) {
+		this->dcamera_x += (rand()%9-rand()%9);//3
+		this->dcamera_y += (rand()%9-rand()%9);
+
+		this->button_vibration--;
+	}
+
+	if (this->dcamera_x != this->camera_x)
+		this->dcamera_a = (this->camera_x - this->dcamera_x) / 15;
+
+	if (this->dcamera_y != this->camera_y)
+		this->dcamera_b = (this->camera_y - this->dcamera_y) / 15;
+
+	if (this->dcamera_a > 6)
+		this->dcamera_a = 6;
+
+	if (this->dcamera_a < -6)
+		this->dcamera_a = -6;
+
+	if (this->dcamera_b > 6)
+		this->dcamera_b = 6;
+
+	if (this->dcamera_b < -6)
+		this->dcamera_b = -6;
+
+	this->dcamera_x += this->dcamera_a;
+	this->dcamera_y += this->dcamera_b;
+
+	this->camera_x = (int)this->dcamera_x;
+	this->camera_y = (int)this->dcamera_y;
+
+	if (this->camera_x < 0)
+		this->camera_x = 0;
+
+	if (this->camera_y < 0)
+		this->camera_y = 0;
+
+	if (this->camera_x > int(sector->getWidth() -screen_width/32)*32)
+		this->camera_x = int(sector->getWidth()-screen_width/32)*32;
+
+	if (this->camera_y > int(sector->getHeight()-screen_height/32)*32)
+		this->camera_y = int(sector->getHeight()-screen_height/32)*32;
+}
+
+
